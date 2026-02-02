@@ -1,0 +1,144 @@
+author: William Duncan
+category: context_updater
+class_name: ProjectATHENA
+creation_date_time: '2025-09-05T16:30:00.000000'
+description: An implementation of the Project ATHENA architecture, a multi-persona
+  AI grounded in cognitive theory. It deconstructs the AI into specialized personas,
+  each with isolated memory, whose outputs are synthesized into a single narrative.
+last_update_date_time: '2025-09-05T16:30:00.000000'
+name: athena_engine
+parameters: []
+returns: {}
+static_parameters:
+- help: Operational mode for persona interaction.
+  name: operation_mode
+  options:
+  - standard
+  - collaborative
+  - adversarial
+  type: str
+  value: standard
+- help: Enable evolving ethical oversight.
+  name: enable_constitutional_persona
+  type: bool
+  value: true
+- help: Enable background thought generation between queries.
+  name: enable_stream_of_consciousness
+  type: bool
+  value: false
+- help: Track and resolve conflicting beliefs.
+  name: enable_belief_tension_tracking
+  type: bool
+  value: true
+- help: Maintain detailed error history for learning.
+  name: enable_error_autobiography
+  type: bool
+  value: true
+- help: Prepare for dream-like LoRA consolidation during sleep.
+  name: enable_dream_consolidation
+  type: bool
+  value: true
+- help: Allow natural curiosity to emerge and persist.
+  name: enable_curiosity_emergence
+  type: bool
+  value: true
+- help: Threshold for expressing confusion honestly (0-1).
+  name: confusion_expression_threshold
+  type: float
+  value: 0.4
+- help: Use weights to prioritize personas.
+  name: enable_persona_weighting
+  type: bool
+  value: false
+- help: Override automatic routing.
+  name: enable_manual_override
+  type: bool
+  value: false
+- help: Maximum discussion turns in collaborative mode.
+  name: max_collaboration_turns
+  type: int
+  value: 3
+- help: Database directory path.
+  name: db_path
+  type: str
+  value: persona_databases/athena
+- help: Output formatting style.
+  name: final_output_format
+  options:
+  - dialogue
+  - chat
+  - narrative
+  - visual_dialogue
+  - rich_chat
+  - screenplay
+  - formal_transcript
+  - email_thread
+  - debrief_report
+  - mind_map
+  type: str
+  value: visual_dialogue
+- help: Enable Linguistic Intelligence.
+  name: linguistic_enabled
+  type: bool
+  value: true
+- help: Linguistic weight.
+  name: linguistic_weight
+  type: float
+  value: 1.0
+- help: Enable Logical-Mathematical Intelligence.
+  name: logical_mathematical_enabled
+  type: bool
+  value: true
+- help: Logical-Mathematical weight.
+  name: logical_mathematical_weight
+  type: float
+  value: 1.0
+- help: Enable Visual-Spatial Intelligence.
+  name: spatial_enabled
+  type: bool
+  value: true
+- help: Visual-Spatial weight.
+  name: spatial_weight
+  type: float
+  value: 1.0
+- help: Enable Musical Intelligence.
+  name: musical_enabled
+  type: bool
+  value: false
+- help: Musical weight.
+  name: musical_weight
+  type: float
+  value: 1.0
+- help: Enable Bodily-Kinesthetic Intelligence.
+  name: bodily_kinesthetic_enabled
+  type: bool
+  value: false
+- help: Bodily-Kinesthetic weight.
+  name: bodily_kinesthetic_weight
+  type: float
+  value: 1.0
+- help: Enable Interpersonal Intelligence.
+  name: interpersonal_enabled
+  type: bool
+  value: true
+- help: Interpersonal weight.
+  name: interpersonal_weight
+  type: float
+  value: 1.0
+- help: Enable Intrapersonal Intelligence.
+  name: intrapersonal_enabled
+  type: bool
+  value: true
+- help: Intrapersonal weight.
+  name: intrapersonal_weight
+  type: float
+  value: 1.0
+- help: Enable Naturalist Intelligence.
+  name: naturalist_enabled
+  type: bool
+  value: false
+- help: Naturalist weight.
+  name: naturalist_weight
+  type: float
+  value: 1.0
+version: 1.0.0
