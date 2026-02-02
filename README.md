@@ -90,7 +90,11 @@ You can trigger specific cognitive workflows using these keywords:
 
 ## 📐 Architecture Overview
 
-![Athena Architecture Diagram](https://github.com/photogbill/Athena-Prototype/blob/main/Athena_Mermaid_Diagram_Full.svg?raw=true)
+<a href="https://github.com/photogbill/Athena-Prototype/blob/main/Athena_Mermaid_Diagram_Full.svg?raw=true" target="_blank">
+  <img src="https://github.com/photogbill/Athena-Prototype/blob/main/Athena_Mermaid_Diagram_Full.svg?raw=true" alt="Athena Architecture Diagram" width="100%">
+</a>
+
+> *Click the diagram above to open it in a new tab, where you can zoom in to read the details.*
 
 ---
 
