@@ -90,7 +90,7 @@ You can trigger specific cognitive workflows using these keywords:
 
 ## 📐 Architecture Overview
 
-![Athena Architecture Diagram](https://github.com/photogbill/Athena-Prototype/blob/main/Athena_Full_Diagram_20250919.png?raw=true)
+![Athena Architecture Diagram](https://github.com/photogbill/Athena-Prototype/blob/main/Athena_Mermaid_Diagram_Full.svg?raw=true)
 
 ---
 
