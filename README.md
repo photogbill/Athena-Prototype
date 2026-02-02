@@ -90,26 +90,7 @@ Simply chat with the AI. [cite_start]ATHENA will silently route your query to th
 
 ## 📐 Architecture Overview
 
-```mermaid
-graph TD
-    User[User Query] --> Orch[Orchestrator]
-    Orch -->|Cognitive State Analysis| Router{Routing}
-    
-    Router -->|Logic/Code| Logic[Logical-Mathematical]
-    Router -->|Visuals| Spatial[Visual-Spatial]
-    Router -->|Human Dynamics| Inter[Interpersonal]
-    Router -->|Ethics| Const[Constitutional Persona]
-    
-    Logic --> Memory[(Isolated Memory)]
-    Spatial --> Memory
-    Inter --> Memory
-    
-    Logic -->|Output| Composer[Athena Composer]
-    Spatial -->|Output| Composer
-    Inter -->|Output| Composer
-    Const -->|Review| Composer
-    
-    Composer -->|Synthesis| Final[Final Response]
+
     
     subgraph "Background Process"
     Stream[Stream of Consciousness] -.-> Composer
