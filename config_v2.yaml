@@ -1,0 +1,262 @@
+author: William Duncan
+category: context_updater
+class_name: ProjectATHENA
+creation_date_time: '2025-09-05T16:30:00.000000'
+description: An implementation of the Project ATHENA architecture, a multi-persona
+  AI grounded in cognitive theory. It deconstructs the AI into specialized personas,
+  each with isolated memory, whose outputs are synthesized into a single narrative.
+  Per-persona heterogeneous model support via lollms_client's llama_cpp_server binding.
+last_update_date_time: '2026-05-17T23:30:00.000000'
+name: athena_engine
+parameters: []
+returns: {}
+static_parameters:
+
+# ============================================================================
+# Core operational settings
+# ============================================================================
+- help: Operational mode for persona interaction.
+  name: operation_mode
+  options:
+  - standard
+  - collaborative
+  - adversarial
+  type: str
+  value: standard
+- help: Enable evolving ethical oversight.
+  name: enable_constitutional_persona
+  type: bool
+  value: true
+- help: Enable background thought generation between queries.
+  name: enable_stream_of_consciousness
+  type: bool
+  value: false
+- help: Track and resolve conflicting beliefs.
+  name: enable_belief_tension_tracking
+  type: bool
+  value: true
+- help: Maintain detailed error history for learning.
+  name: enable_error_autobiography
+  type: bool
+  value: true
+- help: Prepare for dream-like LoRA consolidation during sleep.
+  name: enable_dream_consolidation
+  type: bool
+  value: true
+- help: Allow natural curiosity to emerge and persist.
+  name: enable_curiosity_emergence
+  type: bool
+  value: true
+- help: Threshold for expressing confusion honestly (0-1).
+  name: confusion_expression_threshold
+  type: float
+  value: 0.4
+- help: Use weights to prioritize personas.
+  name: enable_persona_weighting
+  type: bool
+  value: false
+- help: Override automatic routing.
+  name: enable_manual_override
+  type: bool
+  value: false
+- help: Maximum discussion turns in collaborative mode.
+  name: max_collaboration_turns
+  type: int
+  value: 3
+- help: Database directory path.
+  name: db_path
+  type: str
+  value: persona_databases/athena
+- help: Output formatting style.
+  name: final_output_format
+  options:
+  - dialogue
+  - chat
+  - narrative
+  - visual_dialogue
+  - rich_chat
+  - screenplay
+  - formal_transcript
+  - email_thread
+  - debrief_report
+  - mind_map
+  type: str
+  value: visual_dialogue
+
+# ============================================================================
+# v2 cognitive-isolation and analysis flags
+# ============================================================================
+- help: When True, each persona sees prior personas' responses (legacy chained mode).
+    When False (default), each persona analyzes the user query in cognitive isolation
+    and only the Composer sees the full set of specialist outputs.
+  name: enable_persona_cross_visibility
+  type: bool
+  value: false
+- help: When True, replace lexical heuristics (confidence / uncertainty / curiosity /
+    tension / valence extraction) with a single consolidated LLM judgment per persona
+    response. Costs +1 LLM call per persona but produces signals that reflect meaning
+    rather than word counts. Falls back to heuristics automatically on JSON parse failure.
+  name: enable_model_graded_judgments
+  type: bool
+  value: true
+- help: When True, the Composer retrieves its own past syntheses on related queries
+    and includes them as integration-pattern context. Lets the system learn how to
+    integrate diverse perspectives over time rather than starting fresh each query.
+  name: enable_composer_self_rag
+  type: bool
+  value: true
+- help: When True, the Composer sees the last few turns of actual conversation history
+    so it can reference what was just discussed.
+  name: enable_conversation_memory
+  type: bool
+  value: true
+- help: When True, append a brief routing explanation to the user-visible response
+    footer showing which personas were selected and why.
+  name: enable_routing_transparency
+  type: bool
+  value: false
+
+# ============================================================================
+# v3 per-persona model heterogeneity (NEW)
+# ============================================================================
+- help: 'MASTER SWITCH for per-persona models. When False (default), all personas
+    share self.app.personality (backward compatible). When True, personas with a
+    non-empty *_model_path use that specific GGUF via lollms_client llama_cpp_server
+    binding; personas without one fall back to the shared model.'
+  name: enable_per_persona_models
+  type: bool
+  value: false
+- help: 'Shared models directory. All per-persona LollmsClient instances point here.
+    GGUF files for the per-persona model_path entries below must exist in this folder.'
+  name: athena_models_path
+  type: str
+  value: data/models/llama_cpp_models
+- help: 'Directory for the llama.cpp server binaries that lollms spawns per model.'
+  name: athena_binaries_path
+  type: str
+  value: data/bin/llm/llama_cpp_server
+- help: 'How many persona models can be loaded in VRAM simultaneously. 1 = sequential
+    swap (safe for ~16GB VRAM with ~15GB models like Mistral Small 24B Q4). 2+ allows
+    concurrent loading if VRAM permits.'
+  name: max_active_models
+  type: int
+  value: 1
+
+# ============================================================================
+# Per-persona configuration: enabled / weight / model_path
+# ============================================================================
+- help: Enable Linguistic Intelligence.
+  name: linguistic_enabled
+  type: bool
+  value: true
+- help: Linguistic weight.
+  name: linguistic_weight
+  type: float
+  value: 1.0
+- help: 'Optional GGUF filename (relative to athena_models_path) for the Linguistic
+    persona. Empty = use shared model. Suggested: a strong general-prose model
+    like Llama-3.1-8B-Instruct-Q4_K_M.gguf or Mistral Nemo.'
+  name: linguistic_model_path
+  type: str
+  value: ''
+
+- help: Enable Logical-Mathematical Intelligence.
+  name: logical_mathematical_enabled
+  type: bool
+  value: true
+- help: Logical-Mathematical weight.
+  name: logical_mathematical_weight
+  type: float
+  value: 1.0
+- help: 'Optional GGUF for the Logical-Mathematical persona. Suggested: a math-tuned
+    model like Qwen2.5-Math-7B-Instruct-Q4_K_M.gguf or DeepSeek-Math-7B.'
+  name: logical_mathematical_model_path
+  type: str
+  value: ''
+
+- help: Enable Visual-Spatial Intelligence.
+  name: spatial_enabled
+  type: bool
+  value: true
+- help: Visual-Spatial weight.
+  name: spatial_weight
+  type: float
+  value: 1.0
+- help: 'Optional GGUF for the Spatial persona. Suggested: a vision-language model
+    when query has visual content (Pixtral 12B, Qwen2-VL 7B, Llama-3.2-Vision).'
+  name: spatial_model_path
+  type: str
+  value: ''
+
+- help: Enable Musical Intelligence.
+  name: musical_enabled
+  type: bool
+  value: false
+- help: Musical weight.
+  name: musical_weight
+  type: float
+  value: 1.0
+- help: 'Optional GGUF for the Musical persona. Smaller general models work fine here
+    (rhythm/sequence is pattern-heavy, less reasoning-heavy).'
+  name: musical_model_path
+  type: str
+  value: ''
+
+- help: Enable Bodily-Kinesthetic Intelligence.
+  name: bodily_kinesthetic_enabled
+  type: bool
+  value: false
+- help: Bodily-Kinesthetic weight.
+  name: bodily_kinesthetic_weight
+  type: float
+  value: 1.0
+- help: 'Optional GGUF for the Bodily-Kinesthetic persona. Suggested: a code-specialized
+    model (Codestral 22B, DeepSeek-Coder-6.7B) for the ROBOTICS classification path;
+    a general model is fine for cooking/repair/exercise domain classifications.'
+  name: bodily_kinesthetic_model_path
+  type: str
+  value: ''
+
+- help: Enable Interpersonal Intelligence.
+  name: interpersonal_enabled
+  type: bool
+  value: true
+- help: Interpersonal weight.
+  name: interpersonal_weight
+  type: float
+  value: 1.0
+- help: 'Optional GGUF for the Interpersonal persona. Heavy-RLHF instruction-tuned
+    models suit this domain (Llama-3.1-8B-Instruct, Hermes-3).'
+  name: interpersonal_model_path
+  type: str
+  value: ''
+
+- help: Enable Intrapersonal Intelligence.
+  name: intrapersonal_enabled
+  type: bool
+  value: true
+- help: Intrapersonal weight.
+  name: intrapersonal_weight
+  type: float
+  value: 1.0
+- help: 'Optional GGUF for the Intrapersonal persona. Reasoning-tuned models suit
+    reflective self-questioning (DeepSeek-R1-Distill-Llama-8B, QwQ-32B).'
+  name: intrapersonal_model_path
+  type: str
+  value: ''
+
+- help: Enable Naturalist Intelligence.
+  name: naturalist_enabled
+  type: bool
+  value: false
+- help: Naturalist weight.
+  name: naturalist_weight
+  type: float
+  value: 1.0
+- help: 'Optional GGUF for the Naturalist persona. Long-context models suit systems
+    thinking across many memory entries (Qwen2.5-14B long-context).'
+  name: naturalist_model_path
+  type: str
+  value: ''
+
+version: 2.0.0
