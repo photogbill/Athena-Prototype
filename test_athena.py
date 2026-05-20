@@ -712,6 +712,141 @@ def test_v3_config_flags_present():
                   f"v3 config flag {name} not in ConfigTemplate")
 
 
+def test_peft_optional_imports():
+    """v3.1: PEFT-stack imports must be optional with graceful fallback flags."""
+    mod = _load_function_module()
+    for flag in ("_HAS_TORCH", "_HAS_PEFT", "_HAS_BNB", "_HAS_TRANSFORMERS", "_HAS_PEFT_STACK"):
+        assert_true(hasattr(mod, flag), f"missing PEFT optional-import flag: {flag}")
+    # All False in the test environment (none of these are installed); proves the guards work
+    assert_eq(mod._HAS_PEFT, False, "_HAS_PEFT should be False in test env")
+    assert_eq(mod._HAS_PEFT_STACK, False, "_HAS_PEFT_STACK should reflect actual availability")
+
+
+def test_peft_constants_present():
+    """v3.1: PEFT default constants exist with sensible values."""
+    mod = _load_function_module()
+    constants = {
+        "ATHENA_PEFT_DEFAULT_RANK":           (1, 256),
+        "ATHENA_PEFT_DEFAULT_ALPHA":          (1.0, 256.0),
+        "ATHENA_PEFT_DEFAULT_DROPOUT":        (0.0, 0.5),
+        "ATHENA_PEFT_DEFAULT_LR":             (1e-6, 1e-2),
+        "ATHENA_PEFT_DEFAULT_EPOCHS":         (1, 20),
+        "ATHENA_PEFT_MIN_TRAINING_EXAMPLES":  (10, 100000),
+        "ATHENA_PEFT_ANCHOR_RATIO":           (0.0, 100.0),
+        "ATHENA_PEFT_VALIDATION_THRESHOLD":   (0.0, 1.0),
+    }
+    for name, (lo, hi) in constants.items():
+        assert_true(hasattr(mod, name), f"PEFT constant missing: {name}")
+        v = getattr(mod, name)
+        assert_true(lo <= v <= hi, f"{name}={v} out of expected range [{lo}, {hi}]")
+
+
+def test_peft_trainer_class_present():
+    """v3.1: PEFTTrainer class must be defined and have the expected public surface."""
+    mod = _load_function_module()
+    assert_true(hasattr(mod, "PEFTTrainer"), "PEFTTrainer class missing from function.py")
+    cls = mod.PEFTTrainer
+    expected_methods = (
+        "train_all_personas",
+        "_train_one_persona",
+        "_build_training_dataset",
+        "_mix_anchor_set",
+        "_validate_adapter",
+        "_apply_adapter_strategy",
+        "_train_pissa_qlora",
+        "_train_qdora",
+        "_train_fsdp_qdora",
+        "_train_galore",
+        "_train_qgalore",
+    )
+    for method in expected_methods:
+        assert_true(hasattr(cls, method), f"PEFTTrainer missing method: {method}")
+
+
+def test_peft_trainer_disabled_by_default():
+    """v3.1: PEFTTrainer must report 'skipped_disabled' when not enabled."""
+    mod = _load_function_module()
+
+    class FakeApp:
+        def info(self, msg): pass
+        def warning(self, msg): pass
+        def success(self, msg): pass
+        def error(self, msg): pass
+
+    # Default config: enable_lora_training=False -> all skip
+    trainer = mod.PEFTTrainer(
+        FakeApp(),
+        {"enable_lora_training": False, "peft_method": "pissa_qlora"},
+        {"Linguistic": object(), "Logical-Mathematical": object()},
+    )
+    results = trainer.train_all_personas()
+    assert_eq(set(results.values()), {"skipped_disabled"},
+              "all personas should be skipped_disabled when enable_lora_training=False")
+
+
+def test_peft_trainer_skips_when_libs_missing():
+    """v3.1: PEFTTrainer must report 'skipped_missing_libs' when torch/peft/transformers absent."""
+    mod = _load_function_module()
+
+    class FakeApp:
+        def info(self, msg): pass
+        def warning(self, msg): pass
+        def success(self, msg): pass
+        def error(self, msg): pass
+
+    # Enabled but libs missing (we know they are missing in test env)
+    trainer = mod.PEFTTrainer(
+        FakeApp(),
+        {"enable_lora_training": True, "peft_method": "pissa_qlora"},
+        {"Linguistic": object()},
+    )
+    results = trainer.train_all_personas()
+    assert_eq(set(results.values()), {"skipped_missing_libs"},
+              "must skip when PEFT stack libraries are missing")
+
+
+def test_peft_config_flags_present():
+    """v3.1: all 27 PEFT config flags must be in ConfigTemplate (basic + advanced).
+
+    The advanced tunables (target_modules, batch sizes, quantization knobs, etc.)
+    are exposed in the lollms UI so contributors don't have to edit function.py.
+    """
+    src = open(FUNCTION_PY, encoding="utf-8-sig").read()
+    for name in (
+        # Basic
+        "enable_lora_training",
+        "peft_method",
+        "lora_rank",
+        "lora_alpha",
+        "lora_dropout",
+        "lora_learning_rate",
+        "lora_epochs",
+        "min_training_examples",
+        "anchor_set_path",
+        "anchor_to_dream_ratio",
+        "adapter_strategy",
+        "validation_quality_threshold",
+        "peft_models_path",
+        # Advanced architecture / hardware / optimization
+        "lora_target_modules",
+        "lora_use_dora",
+        "lora_init_method",
+        "max_sequence_length",
+        "per_device_train_batch_size",
+        "gradient_accumulation_steps",
+        "gradient_checkpointing",
+        "quantization_compute_dtype",
+        "bnb_4bit_quant_type",
+        "bnb_4bit_use_double_quant",
+        "optimizer",
+        "lr_scheduler_type",
+        "warmup_ratio",
+        "weight_decay",
+        "save_strategy",
+    ):
+        assert_in(f'"name": "{name}"', src, f"PEFT config flag missing: {name}")
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------

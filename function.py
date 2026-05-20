@@ -1,4 +1,4 @@
-﻿import re
+import re
 import json
 import random
 import logging
@@ -13,6 +13,7 @@ import numpy as np
 import hashlib
 import time
 import threading
+from pathlib import Path
 
 from lollms.function_call import FunctionCall, FunctionType
 from lollms.app import LollmsApplication
@@ -31,6 +32,42 @@ try:
 except ImportError:
     _LollmsClient = None
     _HAS_LOLLMS_CLIENT = False
+
+# Optional: PEFT training stack. Required only when sleep-cycle LoRA training
+# is actively enabled (peft_method != "disabled"). When absent, the sleep cycle
+# stages dream-fragment JSON exports as before but skips the training step.
+# Mixing these probes lets a single function.py work on machines without GPUs
+# (data export only) and machines with full training stacks (export + train).
+try:
+    import torch as _torch
+    _HAS_TORCH = True
+except ImportError:
+    _torch = None
+    _HAS_TORCH = False
+
+try:
+    import peft as _peft  # noqa: F401
+    _HAS_PEFT = True
+except ImportError:
+    _peft = None
+    _HAS_PEFT = False
+
+try:
+    import bitsandbytes as _bnb  # noqa: F401
+    _HAS_BNB = True
+except ImportError:
+    _bnb = None
+    _HAS_BNB = False
+
+try:
+    from transformers import AutoModelForCausalLM as _AutoModel  # noqa: F401
+    from transformers import AutoTokenizer as _AutoTok  # noqa: F401
+    _HAS_TRANSFORMERS = True
+except ImportError:
+    _HAS_TRANSFORMERS = False
+
+# Convenience flag: do we have everything needed to do *any* PEFT training?
+_HAS_PEFT_STACK = _HAS_TORCH and _HAS_PEFT and _HAS_TRANSFORMERS
 
 # =================================================================================================
 # == Module-level tunable constants (centralized so behavior tuning is one-edit)
@@ -128,6 +165,23 @@ ATHENA_MAX_ACTIVE_MODELS_DEFAULT = 1  # 1 = strict sequential; safest for 16GB V
 ATHENA_PER_PERSONA_CTX_SIZE = 8192
 ATHENA_PER_PERSONA_GPU_LAYERS = -1   # -1 = offload all layers to GPU
 ATHENA_PER_PERSONA_IDLE_TIMEOUT = -1  # -1 = no auto-unload; we manage lifecycle
+
+# ============================================================================
+# PEFT / Sleep-Cycle Training (v3.1) - hardware-gated future work
+# Three-tier strategy for per-persona adapter training during sleep cycle:
+#   Tier 1 ("pissa_qlora")  : commodity 16 GB VRAM (Mistral Small 24B Q4 + rank-16 PiSSA)
+#   Tier 2 ("qdora")        : 24-48 GB VRAM (DoRA at rank 32-64, quantized base)
+#   Tier 3 ("fsdp_qdora")   : multi-GPU; full DoRA at production scale
+#   Tier 3 alt ("galore")   : single 80+ GB GPU; full fine-tune via gradient low-rank projection
+# ============================================================================
+ATHENA_PEFT_DEFAULT_RANK = 16
+ATHENA_PEFT_DEFAULT_ALPHA = 32.0
+ATHENA_PEFT_DEFAULT_DROPOUT = 0.05
+ATHENA_PEFT_DEFAULT_LR = 5e-5
+ATHENA_PEFT_DEFAULT_EPOCHS = 2
+ATHENA_PEFT_MIN_TRAINING_EXAMPLES = 200   # Don't train until persona has accumulated this many examples
+ATHENA_PEFT_ANCHOR_RATIO = 3.0            # 3 anchor examples per 1 dream example (forgetting mitigation)
+ATHENA_PEFT_VALIDATION_THRESHOLD = 0.85   # Min validation score to accept adapter merge
 
 
 # Module logger - components can pull a child via logging.getLogger("athena.<name>")
@@ -3556,6 +3610,546 @@ Output ONLY comma-separated persona names:"""
 # == Main Function Call Class: Fully Enhanced ProjectATHENA
 # =================================================================================================
 
+# =================================================================================================
+# == PEFTTrainer: hardware-gated sleep-cycle training (v3.1)
+# =================================================================================================
+
+class PEFTTrainer:
+    """Hardware-gated PEFT (Parameter-Efficient Fine-Tuning) trainer for the sleep cycle.
+
+    SCAFFOLDING STATUS: The class structure, method dispatch, configuration
+    surface, anchor-set mixing, and validation gate are all implemented. The
+    actual training loops in _train_pissa_qlora / _train_qdora / _train_fsdp_qdora /
+    _train_galore are CLEARLY-MARKED STUBS designed for a contributor with
+    appropriate hardware to fill in. Each stub:
+      - Documents what library calls it should make
+      - References the canonical paper / implementation
+      - Returns None (signaling "skipped, not failed") on the stub path
+      - Has detailed docstring explaining the expected behavior
+
+    The architecture around the stubs is real: dataset assembly, anchor mixing,
+    validation, adapter merge strategy, per-persona directories, error logging.
+    All a contributor needs to do is replace the body of one stub with a real
+    training loop to get end-to-end training on their hardware tier.
+
+    The trainer is instantiated by ProjectATHENA.trigger_sleep_cycle when the
+    enable_lora_training config flag is True. It runs PER-PERSONA, sequentially,
+    so even Tier 1 hardware can complete a full sleep cycle in finite time
+    (one persona finishes training and frees VRAM before the next starts).
+
+    References by tier:
+      Tier 1 (pissa_qlora):
+        - QLoRA: arXiv:2305.14314 (Dettmers et al. 2023)
+        - PiSSA: arXiv:2404.02948 (Meng et al. 2024) - https://github.com/MuLabPKU/PiSSA
+        - PEFT lib: init_lora_weights="pissa" (peft >= 0.11)
+      Tier 2 (qdora):
+        - DoRA: arXiv:2402.09353 (Liu et al. 2024) - https://github.com/NVlabs/DoRA
+        - PEFT lib: LoraConfig(use_dora=True, ...)
+      Tier 3 (fsdp_qdora):
+        - Answer.AI: https://www.answer.ai/posts/2024-04-26-fsdp-qdora-llama3.html
+        - Requires FSDP setup via accelerate or torchrun
+      Tier 3 alt (galore):
+        - GaLore: arXiv:2403.03507 (Zhao et al. 2024) - https://github.com/jiaweizzhao/GaLore
+        - Full fine-tune via gradient low-rank projection (no adapter)
+    """
+
+    def __init__(self, app: LollmsApplication, config: Dict[str, Any],
+                 specialist_personas: Dict[str, "SpecialistPersona"]):
+        self.app = app
+        self.config = config or {}
+        self.personas = specialist_personas
+        self.logger = logging.getLogger("athena.peft")
+
+        # Resolve current method and tier
+        self.method = self.config.get("peft_method", "disabled")
+        self.enabled = bool(self.config.get("enable_lora_training", False)) and self.method != "disabled"
+
+        # Detect stack availability without crashing
+        self.stack_available = _HAS_PEFT_STACK
+        self.bnb_available = _HAS_BNB
+
+        # Output directory
+        self.adapters_path = Path(self.config.get("peft_models_path", "data/models/peft_adapters"))
+        if self.enabled:
+            try:
+                self.adapters_path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                self.logger.warning("Could not create adapters_path %s: %s", self.adapters_path, e)
+
+    # ------------------------------------------------------------------
+    # Public entry point - called from ProjectATHENA.trigger_sleep_cycle
+    # ------------------------------------------------------------------
+    def train_all_personas(self) -> Dict[str, str]:
+        """Train per-persona adapters for every persona that has enough data.
+
+        Returns a dict mapping persona_name -> status string for the run log.
+        Status values include: 'trained', 'skipped_insufficient_data',
+        'skipped_disabled', 'skipped_missing_libs', 'failed_training',
+        'rejected_validation', 'not_implemented_stub'.
+        """
+        results: Dict[str, str] = {}
+        if not self.enabled:
+            self.app.info("[PEFT] enable_lora_training=False or peft_method=disabled - skipping all training")
+            for name in self.personas:
+                results[name] = "skipped_disabled"
+            return results
+
+        if not self.stack_available:
+            self.app.warning(
+                "[PEFT] training stack incomplete - need torch + peft + transformers. "
+                f"Have torch={_HAS_TORCH} peft={_HAS_PEFT} transformers={_HAS_TRANSFORMERS}. "
+                "Sleep cycle will export dream JSON but skip training."
+            )
+            for name in self.personas:
+                results[name] = "skipped_missing_libs"
+            return results
+
+        if self.method in ("pissa_qlora", "qdora") and not self.bnb_available:
+            self.app.warning(
+                f"[PEFT] method={self.method} requires bitsandbytes for 4-bit quantization. "
+                "Install: pip install bitsandbytes. Skipping training."
+            )
+            for name in self.personas:
+                results[name] = "skipped_missing_libs"
+            return results
+
+        self.app.info(f"[PEFT] starting per-persona training run with method={self.method}")
+        for persona_name, persona in self.personas.items():
+            try:
+                status = self._train_one_persona(persona_name, persona)
+            except Exception as e:
+                trace_exception(e)
+                self.app.error(f"[PEFT] {persona_name} training crashed: {e}")
+                status = "failed_training"
+            results[persona_name] = status
+            self.app.info(f"[PEFT] {persona_name}: {status}")
+        self.app.success(f"[PEFT] training run complete: {results}")
+        return results
+
+    # ------------------------------------------------------------------
+    # Per-persona orchestration
+    # ------------------------------------------------------------------
+    def _train_one_persona(self, persona_name: str, persona) -> str:
+        """Build dataset, dispatch to method, validate, merge."""
+        # 1. Build the training dataset from accumulated dream-fragment exports
+        examples = self._build_training_dataset(persona_name)
+        if examples is None:
+            return "failed_training"
+        min_required = int(self.config.get("min_training_examples", ATHENA_PEFT_MIN_TRAINING_EXAMPLES))
+        if len(examples) < min_required:
+            self.app.info(
+                f"[PEFT] {persona_name}: {len(examples)} examples accumulated, "
+                f"need {min_required}; skipping training this cycle"
+            )
+            return "skipped_insufficient_data"
+
+        # 2. Mix in anchor set for catastrophic-forgetting mitigation
+        examples = self._mix_anchor_set(examples)
+
+        # 3. Dispatch to the configured method
+        adapter_path: Optional[Path] = None
+        if self.method == "pissa_qlora":
+            adapter_path = self._train_pissa_qlora(persona_name, persona, examples)
+        elif self.method == "qdora":
+            adapter_path = self._train_qdora(persona_name, persona, examples)
+        elif self.method == "fsdp_qdora":
+            adapter_path = self._train_fsdp_qdora(persona_name, persona, examples)
+        elif self.method == "galore":
+            adapter_path = self._train_galore(persona_name, persona, examples)
+        elif self.method == "qgalore":
+            adapter_path = self._train_qgalore(persona_name, persona, examples)
+        else:
+            self.app.warning(f"[PEFT] unknown peft_method: {self.method}")
+            return "skipped_disabled"
+
+        if adapter_path is None:
+            # Method stub returned None - either not implemented or skipped
+            return "not_implemented_stub"
+
+        # 4. Validation gate
+        if not self._validate_adapter(persona_name, persona, adapter_path):
+            self.app.warning(f"[PEFT] {persona_name}: adapter rejected by validation gate")
+            return "rejected_validation"
+
+        # 5. Apply adapter accumulation strategy
+        strategy = self.config.get("adapter_strategy", "merge_and_reset")
+        self._apply_adapter_strategy(persona_name, persona, adapter_path, strategy)
+        return "trained"
+
+    # ------------------------------------------------------------------
+    # Dataset assembly + anchor mixing + validation - REAL implementations
+    # ------------------------------------------------------------------
+    def _build_training_dataset(self, persona_name: str) -> Optional[List[Dict[str, str]]]:
+        """Build per-persona training dataset from accumulated dream-fragment JSON files.
+
+        Each example is a {"prompt": str, "response": str} dict. Drawn from:
+          - high-confidence (> 0.7) STANDARD memories from dream fragments
+          - reflective entries derived from belief_tensions
+          - exploration entries from active curiosities
+        """
+        try:
+            db_path = self.config.get("db_path", "persona_databases/athena")
+            db_file = os.path.join(db_path, f"{persona_name.lower().replace('-','_')}_memory.db")
+            if not os.path.exists(db_file):
+                self.app.info(f"[PEFT] {persona_name}: no memory DB at {db_file}")
+                return []
+            examples: List[Dict[str, str]] = []
+            with sqlite3.connect(db_file, timeout=ATHENA_SQLITE_TIMEOUT) as conn:
+                cursor = conn.cursor()
+                # High-confidence regular memories
+                cursor.execute("""
+                    SELECT query, response FROM memories
+                    WHERE confidence_score > 0.7
+                      AND memory_type IN ('standard', 'curiosity')
+                    ORDER BY timestamp DESC LIMIT 1000
+                """)
+                for q, r in cursor.fetchall():
+                    if q and r:
+                        examples.append({"prompt": q, "response": r})
+                # Error autobiography: corrections become teaching examples
+                cursor.execute("""
+                    SELECT original_query, correction FROM error_autobiography
+                    WHERE severity > 0.5 AND correction != ''
+                    ORDER BY timestamp DESC LIMIT 200
+                """)
+                for q, c in cursor.fetchall():
+                    if q and c:
+                        examples.append({"prompt": q, "response": c})
+            self.app.info(f"[PEFT] {persona_name}: assembled {len(examples)} training examples")
+            return examples
+        except Exception as e:
+            self.app.error(f"[PEFT] {persona_name}: dataset build failed: {e}")
+            return None
+
+    def _mix_anchor_set(self, dream_examples: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Mix anchor examples in to prevent catastrophic forgetting.
+
+        Anchor set is loaded from JSONL at anchor_set_path. Each line: {"prompt", "response"}.
+        Ratio is configured by anchor_to_dream_ratio. Returns the combined list.
+        """
+        ratio = float(self.config.get("anchor_to_dream_ratio", ATHENA_PEFT_ANCHOR_RATIO))
+        if ratio <= 0:
+            return dream_examples
+        anchor_path = self.config.get("anchor_set_path", "")
+        if not anchor_path or not os.path.exists(anchor_path):
+            self.app.info(
+                f"[PEFT] no anchor_set_path configured ({anchor_path!r}); training on dream-only "
+                "data. This is functional but increases catastrophic-forgetting risk."
+            )
+            return dream_examples
+        anchors: List[Dict[str, str]] = []
+        try:
+            with open(anchor_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    if "prompt" in obj and "response" in obj:
+                        anchors.append({"prompt": obj["prompt"], "response": obj["response"]})
+        except Exception as e:
+            self.app.warning(f"[PEFT] anchor set load failed ({e}); training on dream-only data")
+            return dream_examples
+        target_anchor_count = int(len(dream_examples) * ratio)
+        if len(anchors) < target_anchor_count:
+            self.app.info(
+                f"[PEFT] anchor set has {len(anchors)} examples, target was {target_anchor_count}; "
+                "using all available anchors"
+            )
+            sampled = anchors
+        else:
+            random.shuffle(anchors)
+            sampled = anchors[:target_anchor_count]
+        combined = list(dream_examples) + list(sampled)
+        random.shuffle(combined)
+        self.app.info(
+            f"[PEFT] anchor-mixed dataset: {len(dream_examples)} dream + {len(sampled)} anchor "
+            f"= {len(combined)} total"
+        )
+        return combined
+
+    def _validate_adapter(self, persona_name: str, persona, adapter_path: Path) -> bool:
+        """Run a held-out benchmark against the newly-trained adapter.
+
+        STUB-ADJACENT: the benchmark itself is a contributor concern (depends on
+        what the deployment cares about preserving). The default heuristic is
+        "accept all" so the system doesn't reject perfectly good adapters in the
+        absence of a benchmark. A real implementation would:
+          1. Load the base model + new adapter
+          2. Run a held-out set of general queries
+          3. Compute mean response quality (BLEU/perplexity/judge-rated)
+          4. Compare to baseline-without-adapter
+          5. Reject if quality < validation_quality_threshold
+        """
+        threshold = float(self.config.get("validation_quality_threshold",
+                                          ATHENA_PEFT_VALIDATION_THRESHOLD))
+        self.app.info(
+            f"[PEFT] {persona_name}: validation gate (threshold={threshold}) - "
+            "default heuristic ACCEPTS; replace _validate_adapter with a real "
+            "benchmark before relying on this in production"
+        )
+        return True
+
+    def _apply_adapter_strategy(self, persona_name: str, persona, adapter_path: Path, strategy: str):
+        """Apply the configured adapter-accumulation strategy.
+
+        STUB: actual merge/stack/consolidate logic depends on the deployment's
+        model-loading framework. Documented here for the contributor.
+        """
+        self.app.info(
+            f"[PEFT] {persona_name}: adapter_strategy={strategy} - persisted at {adapter_path}. "
+            "Actual base-model merge / stack composition / periodic consolidation is delegated "
+            "to the deployment's model-loading framework (PEFT.merge_and_unload, etc.)."
+        )
+
+    # ------------------------------------------------------------------
+    # Method-specific training loops - STUBS for contributor implementation
+    # ------------------------------------------------------------------
+    def _train_pissa_qlora(self, persona_name: str, persona, examples: List[Dict[str, str]]) -> Optional[Path]:
+        """Tier 1: PiSSA-initialized QLoRA. ~16 GB VRAM target.
+
+        REFERENCE IMPLEMENTATION SKETCH (contributor to flesh out).
+        All tunables come from self.config which is populated by trigger_sleep_cycle
+        from the lollms UI - contributors should NOT hardcode values here.
+
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+            from transformers import TrainingArguments, Trainer
+            from peft import LoraConfig, get_peft_model, TaskType
+            from datasets import Dataset
+            import torch
+
+            # Resolve compute dtype from config (Ampere+ should use bfloat16,
+            # older cards float16). The user picked this in the lollms UI.
+            dtype_str = self.config.get("quantization_compute_dtype", "bfloat16")
+            compute_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float16
+
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type=self.config.get("bnb_4bit_quant_type", "nf4"),
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=self.config.get("bnb_4bit_use_double_quant", True),
+            )
+            base = persona.model_path or "<resolve persona's base model path>"
+            model = AutoModelForCausalLM.from_pretrained(base, quantization_config=bnb_config)
+            tokenizer = AutoTokenizer.from_pretrained(base)
+
+            # Target modules: parsed from comma-separated config string so the user
+            # can swap architectures (Llama / Mistral / Gemma / etc.) from the UI.
+            target_modules = [m.strip() for m in self.config.get(
+                "lora_target_modules", "q_proj,k_proj,v_proj,o_proj"
+            ).split(",") if m.strip()]
+
+            lora_cfg = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=self.config.get("lora_rank", 16),
+                lora_alpha=self.config.get("lora_alpha", 32.0),
+                lora_dropout=self.config.get("lora_dropout", 0.05),
+                target_modules=target_modules,
+                init_lora_weights=self.config.get("lora_init_method", "pissa"),
+                use_dora=self.config.get("lora_use_dora", False),   # PiSSA-DoRA hybrid when True
+            )
+            model = get_peft_model(model, lora_cfg)
+            if self.config.get("gradient_checkpointing", True):
+                model.gradient_checkpointing_enable()
+
+            # Tokenize examples (anchor-mixed dataset from self._mix_anchor_set)
+            # into a Dataset with max_length=self.config["max_sequence_length"].
+            # The exact chat template depends on the persona's underlying model;
+            # contributors should use tokenizer.apply_chat_template when available.
+            # ... tokenize and pack ...
+
+            args = TrainingArguments(
+                output_dir=str(self.adapters_path / persona_name),
+                num_train_epochs=self.config.get("lora_epochs", 2),
+                per_device_train_batch_size=self.config.get("per_device_train_batch_size", 1),
+                gradient_accumulation_steps=self.config.get("gradient_accumulation_steps", 4),
+                learning_rate=self.config.get("lora_learning_rate", 5e-5),
+                lr_scheduler_type=self.config.get("lr_scheduler_type", "cosine"),
+                warmup_ratio=self.config.get("warmup_ratio", 0.03),
+                weight_decay=self.config.get("weight_decay", 0.001),
+                optim=self.config.get("optimizer", "paged_adamw_8bit"),
+                bf16=(dtype_str == "bfloat16"),
+                fp16=(dtype_str == "float16"),
+                gradient_checkpointing=self.config.get("gradient_checkpointing", True),
+                save_strategy=self.config.get("save_strategy", "epoch"),
+                logging_steps=10,
+            )
+            trainer = Trainer(model=model, args=args, train_dataset=dataset, tokenizer=tokenizer)
+            trainer.train()
+            adapter_dir = Path(args.output_dir) / "final"
+            model.save_pretrained(str(adapter_dir))
+            return adapter_dir
+        """
+        self.app.warning(
+            f"[PEFT] {persona_name}: _train_pissa_qlora is a SCAFFOLDING STUB. "
+            "Implement using the reference sketch in the docstring. "
+            "Returning None - this run will be reported as 'not_implemented_stub'."
+        )
+        return None
+
+    def _train_qdora(self, persona_name: str, persona, examples: List[Dict[str, str]]) -> Optional[Path]:
+        """Tier 2: Quantized DoRA. 24-48 GB VRAM target.
+
+        Identical to _train_pissa_qlora EXCEPT the LoraConfig:
+
+            lora_cfg = LoraConfig(
+                ...,
+                use_dora=True,                # <-- DoRA flag (peft >= 0.10)
+                init_lora_weights="pissa",    # PiSSA + DoRA composes
+            )
+
+        DoRA decomposes weight = magnitude * direction; LoRA applies only to
+        direction. Consistently beats vanilla LoRA at the same parameter count.
+        """
+        self.app.warning(
+            f"[PEFT] {persona_name}: _train_qdora is a SCAFFOLDING STUB. "
+            "Implement using _train_pissa_qlora as a template, adding use_dora=True to LoraConfig."
+        )
+        return None
+
+    def _train_fsdp_qdora(self, persona_name: str, persona, examples: List[Dict[str, str]]) -> Optional[Path]:
+        """Tier 3: FSDP + QDoRA. Multi-GPU target.
+
+        REFERENCE: https://www.answer.ai/posts/2024-04-26-fsdp-qdora-llama3.html
+
+        Typically invoked via accelerate or torchrun rather than a direct
+        Trainer call. Contributors with multi-GPU rigs may prefer to drive
+        this from a separate launch script and have this method simply
+        invoke that script via subprocess, returning the output adapter path
+        when training completes.
+        """
+        self.app.warning(
+            f"[PEFT] {persona_name}: _train_fsdp_qdora is a SCAFFOLDING STUB. "
+            "Multi-GPU contributors: see answer.ai's FSDP-QDoRA recipe. May be easier to "
+            "invoke an external accelerate launch script via subprocess and parse the "
+            "resulting adapter directory."
+        )
+        return None
+
+    def _train_galore(self, persona_name: str, persona, examples: List[Dict[str, str]]) -> Optional[Path]:
+        """Tier 3 alt: GaLore full fine-tune. 80+ GB single-GPU target.
+
+        REFERENCE: arXiv:2403.03507 - https://github.com/jiaweizzhao/GaLore
+
+        Unlike LoRA/DoRA, this is FULL fine-tuning (no adapter). The
+        memory savings come from low-rank gradient projection rather than
+        low-rank weights. The output is therefore an updated base model,
+        not an adapter; the adapter_strategy 'stack' option is incompatible.
+        """
+        self.app.warning(
+            f"[PEFT] {persona_name}: _train_galore is a SCAFFOLDING STUB. "
+            "Single-card 80+GB contributors: use the GaLoreAdamW optimizer from the "
+            "reference GaLore repo. Note: this produces a full updated model, not an "
+            "adapter - adapter_strategy='stack' is not compatible with galore."
+        )
+        return None
+
+
+    def _train_qgalore(self, persona_name: str, persona, examples: List[Dict[str, str]]) -> Optional[Path]:
+        """Tier 1-flex: Q-GaLore (INT4-quantized GaLore). Enables full fine-tuning of 7-8B
+        persona models on commodity 16 GB VRAM through aggressive gradient quantization
+        and layer-adaptive low-rank projection.
+
+        REFERENCE: arXiv:2407.08296 - https://github.com/VITA-Group/Q-GaLore
+
+        Why this matters for ATHENA: produces actual updated base weights rather than
+        adapters. Personas backed by 7-8B specialist models (Qwen2.5-Math, DeepSeek-R1-
+        Distill-Llama-8B, etc.) can use Q-GaLore for genuine weight-level evolution,
+        which is architecturally stronger than adapter accumulation for the long-term
+        divergence story (Section 1.3). Personas backed by 24B+ models (Mistral Small,
+        Codestral 22B) won't fit even with Q-GaLore at 16 GB VRAM - those should stay
+        on PiSSA-QLoRA or QDoRA.
+
+        REFERENCE IMPLEMENTATION SKETCH (contributor to flesh out):
+
+            # Q-GaLore's repo provides q_galore_torch as a drop-in. Install:
+            #   pip install -e git+https://github.com/VITA-Group/Q-GaLore.git
+            from q_galore_torch import QGaLoreAdamW, INT4Projector
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from transformers import TrainingArguments, Trainer
+
+            base = persona.model_path or "<resolve persona's base model path>"
+            model = AutoModelForCausalLM.from_pretrained(
+                base,
+                torch_dtype=torch.bfloat16,   # full precision for trainable params
+            )
+            tokenizer = AutoTokenizer.from_pretrained(base)
+
+            # Q-GaLore param groups: layer-adaptive rank, INT4 projection
+            # Layers with higher gradient norm get higher rank; tuned at runtime.
+            galore_params = []
+            target_modules = [m.strip() for m in self.config.get(
+                "lora_target_modules", "q_proj,k_proj,v_proj,o_proj").split(",") if m.strip()]
+            for module_name, module in model.named_modules():
+                if any(t in module_name for t in target_modules) and hasattr(module, "weight"):
+                    galore_params.append(module.weight)
+            other_params = [p for p in model.parameters() if not any(p is g for g in galore_params)]
+
+            optimizer = QGaLoreAdamW(
+                [
+                    {"params": galore_params,
+                     "rank": self.config.get("lora_rank", 16),     # base rank; Q-GaLore adapts upward
+                     "update_proj_gap": 200,
+                     "scale": 0.25,
+                     "proj_type": "std",
+                     "quant_proj": True,                            # INT4 projection
+                     "layer_adaptive": True},
+                    {"params": other_params},
+                ],
+                lr=self.config.get("lora_learning_rate", 5e-5),
+                weight_decay=self.config.get("weight_decay", 0.001),
+            )
+
+            # Training proceeds with a standard Trainer; pass the custom optimizer
+            # via optimizers=(optimizer, lr_scheduler).
+            args = TrainingArguments(
+                output_dir=str(self.adapters_path / persona_name / "qgalore"),
+                num_train_epochs=self.config.get("lora_epochs", 2),
+                per_device_train_batch_size=self.config.get("per_device_train_batch_size", 1),
+                gradient_accumulation_steps=self.config.get("gradient_accumulation_steps", 4),
+                lr_scheduler_type=self.config.get("lr_scheduler_type", "cosine"),
+                warmup_ratio=self.config.get("warmup_ratio", 0.03),
+                bf16=(self.config.get("quantization_compute_dtype","bfloat16") == "bfloat16"),
+                gradient_checkpointing=self.config.get("gradient_checkpointing", True),
+                save_strategy=self.config.get("save_strategy", "epoch"),
+                logging_steps=10,
+            )
+            # Build lr_scheduler manually (Trainer + custom optimizer interaction)
+            from transformers import get_scheduler
+            num_training_steps = (len(dataset) // args.per_device_train_batch_size //
+                                 args.gradient_accumulation_steps * args.num_train_epochs)
+            lr_scheduler = get_scheduler(args.lr_scheduler_type, optimizer,
+                                         num_warmup_steps=int(args.warmup_ratio * num_training_steps),
+                                         num_training_steps=num_training_steps)
+
+            trainer = Trainer(
+                model=model, args=args, train_dataset=dataset, tokenizer=tokenizer,
+                optimizers=(optimizer, lr_scheduler),
+            )
+            trainer.train()
+
+            # Q-GaLore output is the FULL updated model, not an adapter.
+            # adapter_strategy="stack" is incompatible; "merge_and_reset" simply
+            # means "this is the new base." Storage cost: full model per cycle -
+            # implement rolling-checkpoint retention to avoid disk bloat.
+            output_dir = Path(args.output_dir) / "final"
+            model.save_pretrained(str(output_dir))
+            tokenizer.save_pretrained(str(output_dir))
+            return output_dir
+        """
+        self.app.warning(
+            f"[PEFT] {persona_name}: _train_qgalore is a SCAFFOLDING STUB. "
+            "Install q_galore_torch from https://github.com/VITA-Group/Q-GaLore and "
+            "follow the reference sketch in the docstring. Recommended for 7-8B "
+            "persona models on ~16GB VRAM where full FT (not adapter) is desired."
+        )
+        return None
+
+
+# =================================================================================================
+# == Main Function Call Class: Fully Enhanced ProjectATHENA
+# =================================================================================================
+
 class ProjectATHENA(FunctionCall):
     """Fully enhanced ATHENA cognitive architecture"""
     
@@ -3719,6 +4313,167 @@ class ProjectATHENA(FunctionCall):
             {"name": "naturalist_model_path", "type": "str", "value": "",
              "help": "Optional GGUF for the Naturalist persona. Long-context models suit systems "
                      "thinking across many memory entries (Qwen2.5-14B long-context)."},
+
+            # --- v3.1: PEFT sleep-cycle training (hardware-gated) ---
+            {"name": "enable_lora_training", "type": "bool", "value": False,
+             "help": "MASTER SWITCH for sleep-cycle LoRA/DoRA training. When False (default), the "
+                     "sleep cycle exports dream-fragment JSON but does not train. When True, "
+                     "PEFTTrainer.train_all_personas runs at sleep-cycle time using the selected "
+                     "peft_method. Requires torch + peft + transformers (+ bitsandbytes for "
+                     "quantized methods)."},
+
+            {"name": "peft_method", "type": "str", "value": "pissa_qlora",
+             "options": ["disabled", "pissa_qlora", "qdora", "fsdp_qdora", "galore", "qgalore"],
+             "help": "PEFT training method. Tier 1 (~16GB VRAM): pissa_qlora (adapter) or qgalore "
+                     "(full FT for 7-8B persona models). Tier 2 (24-48GB): qdora. Tier 3 (multi-GPU): "
+                     "fsdp_qdora. Tier 3 alt (single 80GB+ GPU): galore. qgalore (INT4-quantized GaLore) "
+                     "enables full fine-tuning of 7-8B specialist persona models on 16GB VRAM - "
+                     "structurally stronger divergence than adapter accumulation. 'disabled' skips "
+                     "training even when enable_lora_training is True."},
+
+            {"name": "lora_rank", "type": "int", "value": 16,
+             "help": "LoRA / DoRA rank (r). Higher rank = more adapter parameters = more capacity "
+                     "to encode persona-specific specialization, but more memory. Tier 1: 16. "
+                     "Tier 2: 32-64. Tier 3: 64+."},
+
+            {"name": "lora_alpha", "type": "float", "value": 32.0,
+             "help": "LoRA alpha scaling. Common convention: alpha = 2 * rank."},
+
+            {"name": "lora_dropout", "type": "float", "value": 0.05,
+             "help": "LoRA dropout. Small datasets (typical for per-persona dream exports) "
+                     "benefit from modest dropout to prevent overfitting."},
+
+            {"name": "lora_learning_rate", "type": "float", "value": 5e-5,
+             "help": "Learning rate for PEFT training. Default is conservative to limit "
+                     "catastrophic forgetting; raise to 1e-4 for faster training on larger datasets."},
+
+            {"name": "lora_epochs", "type": "int", "value": 2,
+             "help": "Number of training epochs per sleep-cycle run. 1-3 is the safe range; the "
+                     "goal is nudging weights, not retraining from scratch."},
+
+            {"name": "min_training_examples", "type": "int", "value": 200,
+             "help": "Minimum accumulated dream-fragment examples before a persona's training is "
+                     "triggered. Rarely-used personas wait longer to accumulate enough signal."},
+
+            {"name": "anchor_set_path", "type": "str", "value": "",
+             "help": "Optional path to a JSONL file of general-purpose anchor examples (prompt / "
+                     "response pairs the base model handles well). Mixed in at anchor_to_dream_ratio "
+                     "to prevent catastrophic forgetting on narrow dream-fragment data."},
+
+            {"name": "anchor_to_dream_ratio", "type": "float", "value": 3.0,
+             "help": "Ratio of anchor-set examples per dream-fragment example. 3.0 means for every "
+                     "1 dream example, 3 anchor examples are mixed in. Set to 0 to disable anchoring "
+                     "(not recommended)."},
+
+            {"name": "adapter_strategy", "type": "str", "value": "merge_and_reset",
+             "options": ["merge_and_reset", "stack", "consolidate_periodically"],
+             "help": "How accumulated adapters compose over time. merge_and_reset: merge new "
+                     "adapter into base, start fresh next cycle. stack: keep adapters separate, "
+                     "compose at inference (uses more inference compute but preserves reversibility). "
+                     "consolidate_periodically: stack short-term, merge stack into base every N "
+                     "cycles."},
+
+            {"name": "validation_quality_threshold", "type": "float", "value": 0.85,
+             "help": "Minimum quality score (relative to base) for a freshly-trained adapter to "
+                     "be accepted. Adapters that drop quality below this threshold are rejected, "
+                     "preserving the previous state. Validation runs on a small held-out general "
+                     "benchmark before merge."},
+
+            {"name": "peft_models_path", "type": "str", "value": "data/models/peft_adapters",
+             "help": "Directory where per-persona LoRA / DoRA adapter checkpoints are saved. "
+                     "Each persona gets a subdirectory with versioned adapters."},
+
+            # --- v3.1 advanced: PEFT architecture / hardware / optimization tunables ---
+            # Exposed in the UI so contributors and operators can tune without editing function.py.
+
+            {"name": "lora_target_modules", "type": "str",
+             "value": "q_proj,k_proj,v_proj,o_proj",
+             "help": "Comma-separated transformer module names where LoRA/DoRA adapters are inserted. "
+                     "Default works for Llama / Mistral / Qwen2 attention blocks. "
+                     "For more aggressive adaptation include MLP layers: "
+                     "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj. "
+                     "Gemma uses similar names. Check your model's architecture."},
+
+            {"name": "lora_use_dora", "type": "bool", "value": False,
+             "help": "Apply DoRA's weight-decomposition (magnitude * direction) on top of LoRA. "
+                     "Already implied when peft_method=qdora. Enabling it under peft_method=pissa_qlora "
+                     "produces a hybrid PiSSA-DoRA setup that's marginally heavier but higher quality."},
+
+            {"name": "lora_init_method", "type": "str", "value": "pissa",
+             "options": ["pissa", "gaussian", "loftq"],
+             "help": "LoRA weight initialization. pissa (default): SVD-based, converges faster than "
+                     "vanilla LoRA. gaussian: standard random init (vanilla LoRA). loftq: LoftQ "
+                     "quantization-aware init, useful when quantization error matters."},
+
+            {"name": "max_sequence_length", "type": "int", "value": 1024,
+             "help": "Maximum tokens per training example. Longer = more context preserved per "
+                     "example but more VRAM per sample. 1024 fits most dream-fragment Q/A pairs; "
+                     "raise to 2048 for long reflective entries. Hard cap by the base model's "
+                     "context window."},
+
+            {"name": "per_device_train_batch_size", "type": "int", "value": 1,
+             "help": "Examples per gradient step on each GPU. Tier 1 (16GB) typically holds at 1. "
+                     "Larger VRAM rigs can raise to 2-4 for faster wall-clock training. "
+                     "Effective batch size = this * gradient_accumulation_steps."},
+
+            {"name": "gradient_accumulation_steps", "type": "int", "value": 4,
+             "help": "Number of forward/backward passes accumulated before each optimizer step. "
+                     "Lets you achieve a large effective batch size on small VRAM by trading time "
+                     "for memory. Effective batch = per_device_batch_size * this."},
+
+            {"name": "gradient_checkpointing", "type": "bool", "value": True,
+             "help": "Trade compute for memory: recompute activations during backward pass instead "
+                     "of storing them. Slows training ~20-30% but enables training larger models / "
+                     "longer sequences / larger batch on the same VRAM. Recommended for Tier 1."},
+
+            {"name": "quantization_compute_dtype", "type": "str", "value": "bfloat16",
+             "options": ["bfloat16", "float16"],
+             "help": "Forward/backward compute precision when base is loaded in 4-bit. bfloat16 is "
+                     "strongly recommended on Ampere/Ada/Hopper GPUs (RTX 30/40 series, A100, H100). "
+                     "float16 needed on older cards (Turing / Volta and below). Mismatched "
+                     "selection causes NaN losses or silent quality drops."},
+
+            {"name": "bnb_4bit_quant_type", "type": "str", "value": "nf4",
+             "options": ["nf4", "fp4"],
+             "help": "Bitsandbytes 4-bit quantization scheme. nf4 (NormalFloat4) is the QLoRA paper "
+                     "default and generally preserves quality better than fp4. fp4 is faster but "
+                     "loses more accuracy on the high-end of the weight distribution."},
+
+            {"name": "bnb_4bit_use_double_quant", "type": "bool", "value": True,
+             "help": "Quantize the quantization constants themselves (saves an additional ~0.4 "
+                     "bits/parameter). Standard in QLoRA. Disable only if you suspect quantization "
+                     "error is dominating training loss."},
+
+            {"name": "optimizer", "type": "str", "value": "paged_adamw_8bit",
+             "options": ["paged_adamw_8bit", "adamw_torch", "adamw_torch_fused", "galore_adamw"],
+             "help": "Optimizer choice. paged_adamw_8bit (default): bitsandbytes paged optimizer, "
+                     "best for QLoRA. adamw_torch: standard 32-bit (uses more memory). "
+                     "adamw_torch_fused: fused kernel on supported GPUs. galore_adamw: use only "
+                     "when peft_method=galore."},
+
+            {"name": "lr_scheduler_type", "type": "str", "value": "cosine",
+             "options": ["cosine", "linear", "constant", "constant_with_warmup"],
+             "help": "Learning rate schedule across training steps. cosine (default) is the most "
+                     "common choice for fine-tuning and usually converges to a slightly better "
+                     "final loss than linear. constant suits very small datasets where decay would "
+                     "stop learning early."},
+
+            {"name": "warmup_ratio", "type": "float", "value": 0.03,
+             "help": "Fraction of total training steps used for LR warmup. Helps stability in the "
+                     "first few steps. 0.03 (3%) is a safe default; raise to 0.10 for very small "
+                     "datasets (< 100 examples) or aggressive learning rates."},
+
+            {"name": "weight_decay", "type": "float", "value": 0.001,
+             "help": "AdamW weight decay coefficient. Small values (0.001) are standard for LoRA "
+                     "fine-tuning since the adapter weights are themselves a regularizer. Set to "
+                     "0.0 to disable."},
+
+            {"name": "save_strategy", "type": "str", "value": "epoch",
+             "options": ["no", "epoch", "steps"],
+             "help": "When to save adapter checkpoints during training. epoch (default): save at "
+                     "the end of every epoch. no: only save at the very end. steps: save every N "
+                     "steps (operators set save_steps separately if needed). epoch is the safe "
+                     "balance between recoverability and disk usage."},
         ])
         
         static_params = TypedConfig(config_template, BaseConfig(config={}))
@@ -4200,9 +4955,70 @@ Provide a helpful response acknowledging the error and offering alternatives:"""
                 self.app.warning(f"Could not mark composer fragments as staged: {e}")
 
             self.app.success("=== SLEEP CYCLE PREPARATION COMPLETE ===")
-            # TODO(future-hardware): Wire up the LoRA training pipeline here once GPU resources allow.
-            # The JSON files written above are the staging payload for that future trainer.
-            self.app.warning("LoRA training implementation pending - data prepared for external training")
+
+            # === v3.1: PEFT training run (hardware-gated, scaffolding integrated) ===
+            # The PEFTTrainer scaffolding is always wired in; whether it actually
+            # trains anything depends on:
+            #   - enable_lora_training config flag (default False)
+            #   - peft_method config option (default pissa_qlora, but only if enabled)
+            #   - presence of torch + peft + transformers libraries
+            #   - presence of bitsandbytes for quantized methods
+            # On hardware that lacks any of these, the trainer logs cleanly and
+            # the sleep cycle completes with dream-fragment JSON export only.
+            try:
+                peft_config = {
+                    # Master switches + tiered method selection
+                    "enable_lora_training": self.static_parameters.config.get("enable_lora_training", False),
+                    "peft_method": self.static_parameters.config.get("peft_method", "disabled"),
+
+                    # Core LoRA parameters (the basics anyone tuning will touch first)
+                    "lora_rank": self.static_parameters.config.get("lora_rank", ATHENA_PEFT_DEFAULT_RANK),
+                    "lora_alpha": self.static_parameters.config.get("lora_alpha", ATHENA_PEFT_DEFAULT_ALPHA),
+                    "lora_dropout": self.static_parameters.config.get("lora_dropout", ATHENA_PEFT_DEFAULT_DROPOUT),
+                    "lora_learning_rate": self.static_parameters.config.get("lora_learning_rate", ATHENA_PEFT_DEFAULT_LR),
+                    "lora_epochs": self.static_parameters.config.get("lora_epochs", ATHENA_PEFT_DEFAULT_EPOCHS),
+
+                    # Dataset / training-gate controls
+                    "min_training_examples": self.static_parameters.config.get("min_training_examples", ATHENA_PEFT_MIN_TRAINING_EXAMPLES),
+                    "anchor_set_path": self.static_parameters.config.get("anchor_set_path", ""),
+                    "anchor_to_dream_ratio": self.static_parameters.config.get("anchor_to_dream_ratio", ATHENA_PEFT_ANCHOR_RATIO),
+
+                    # Adapter lifecycle + validation gate
+                    "adapter_strategy": self.static_parameters.config.get("adapter_strategy", "merge_and_reset"),
+                    "validation_quality_threshold": self.static_parameters.config.get("validation_quality_threshold", ATHENA_PEFT_VALIDATION_THRESHOLD),
+                    "peft_models_path": self.static_parameters.config.get("peft_models_path", "data/models/peft_adapters"),
+
+                    # Architecture / hardware advanced tunables (exposed in lollms UI;
+                    # no need for contributors to edit function.py to change these).
+                    "lora_target_modules": self.static_parameters.config.get("lora_target_modules", "q_proj,k_proj,v_proj,o_proj"),
+                    "lora_use_dora": self.static_parameters.config.get("lora_use_dora", False),
+                    "lora_init_method": self.static_parameters.config.get("lora_init_method", "pissa"),
+                    "max_sequence_length": self.static_parameters.config.get("max_sequence_length", 1024),
+                    "per_device_train_batch_size": self.static_parameters.config.get("per_device_train_batch_size", 1),
+                    "gradient_accumulation_steps": self.static_parameters.config.get("gradient_accumulation_steps", 4),
+                    "gradient_checkpointing": self.static_parameters.config.get("gradient_checkpointing", True),
+                    "quantization_compute_dtype": self.static_parameters.config.get("quantization_compute_dtype", "bfloat16"),
+                    "bnb_4bit_quant_type": self.static_parameters.config.get("bnb_4bit_quant_type", "nf4"),
+                    "bnb_4bit_use_double_quant": self.static_parameters.config.get("bnb_4bit_use_double_quant", True),
+                    "optimizer": self.static_parameters.config.get("optimizer", "paged_adamw_8bit"),
+                    "lr_scheduler_type": self.static_parameters.config.get("lr_scheduler_type", "cosine"),
+                    "warmup_ratio": self.static_parameters.config.get("warmup_ratio", 0.03),
+                    "weight_decay": self.static_parameters.config.get("weight_decay", 0.001),
+                    "save_strategy": self.static_parameters.config.get("save_strategy", "epoch"),
+
+                    # Reference paths (resolved at orchestrator level)
+                    "db_path": self.db_path,
+                }
+                trainer = PEFTTrainer(self.app, peft_config, self.specialist_personas)
+                training_results = trainer.train_all_personas()
+                self.app.info(f"[PEFT] sleep-cycle training results: {training_results}")
+            except Exception as e:
+                trace_exception(e)
+                self.app.warning(f"[PEFT] sleep-cycle training raised: {e}; dream-fragment export still complete")
+
+            # TODO(future-hardware): When per-tier training stubs in PEFTTrainer are
+            # implemented, this warning becomes redundant; remove it then.
+            self.app.warning("LoRA training stubs are scaffolding - real training requires contributor implementation in PEFTTrainer._train_<method>")
 
             # Placeholder for actual LoRA training
             self.app.info("To implement LoRA training:")

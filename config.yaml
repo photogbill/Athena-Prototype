@@ -5,11 +5,16 @@ creation_date_time: '2025-09-05T16:30:00.000000'
 description: An implementation of the Project ATHENA architecture, a multi-persona
   AI grounded in cognitive theory. It deconstructs the AI into specialized personas,
   each with isolated memory, whose outputs are synthesized into a single narrative.
-last_update_date_time: '2025-09-05T16:30:00.000000'
+  Per-persona heterogeneous model support via lollms_client's llama_cpp_server binding.
+last_update_date_time: '2026-05-17T23:30:00.000000'
 name: athena_engine
 parameters: []
 returns: {}
 static_parameters:
+
+# ============================================================================
+# Core operational settings
+# ============================================================================
 - help: Operational mode for persona interaction.
   name: operation_mode
   options:
@@ -77,6 +82,69 @@ static_parameters:
   - mind_map
   type: str
   value: visual_dialogue
+
+# ============================================================================
+# v2 cognitive-isolation and analysis flags
+# ============================================================================
+- help: When True, each persona sees prior personas' responses (legacy chained mode).
+    When False (default), each persona analyzes the user query in cognitive isolation
+    and only the Composer sees the full set of specialist outputs.
+  name: enable_persona_cross_visibility
+  type: bool
+  value: false
+- help: When True, replace lexical heuristics (confidence / uncertainty / curiosity /
+    tension / valence extraction) with a single consolidated LLM judgment per persona
+    response. Costs +1 LLM call per persona but produces signals that reflect meaning
+    rather than word counts. Falls back to heuristics automatically on JSON parse failure.
+  name: enable_model_graded_judgments
+  type: bool
+  value: true
+- help: When True, the Composer retrieves its own past syntheses on related queries
+    and includes them as integration-pattern context. Lets the system learn how to
+    integrate diverse perspectives over time rather than starting fresh each query.
+  name: enable_composer_self_rag
+  type: bool
+  value: true
+- help: When True, the Composer sees the last few turns of actual conversation history
+    so it can reference what was just discussed.
+  name: enable_conversation_memory
+  type: bool
+  value: true
+- help: When True, append a brief routing explanation to the user-visible response
+    footer showing which personas were selected and why.
+  name: enable_routing_transparency
+  type: bool
+  value: false
+
+# ============================================================================
+# v3 per-persona model heterogeneity (NEW)
+# ============================================================================
+- help: 'MASTER SWITCH for per-persona models. When False (default), all personas
+    share self.app.personality (backward compatible). When True, personas with a
+    non-empty *_model_path use that specific GGUF via lollms_client llama_cpp_server
+    binding; personas without one fall back to the shared model.'
+  name: enable_per_persona_models
+  type: bool
+  value: false
+- help: 'Shared models directory. All per-persona LollmsClient instances point here.
+    GGUF files for the per-persona model_path entries below must exist in this folder.'
+  name: athena_models_path
+  type: str
+  value: data/models/llama_cpp_models
+- help: 'Directory for the llama.cpp server binaries that lollms spawns per model.'
+  name: athena_binaries_path
+  type: str
+  value: data/bin/llm/llama_cpp_server
+- help: 'How many persona models can be loaded in VRAM simultaneously. 1 = sequential
+    swap (safe for ~16GB VRAM with ~15GB models like Mistral Small 24B Q4). 2+ allows
+    concurrent loading if VRAM permits.'
+  name: max_active_models
+  type: int
+  value: 1
+
+# ============================================================================
+# Per-persona configuration: enabled / weight / model_path
+# ============================================================================
 - help: Enable Linguistic Intelligence.
   name: linguistic_enabled
   type: bool
@@ -85,6 +153,13 @@ static_parameters:
   name: linguistic_weight
   type: float
   value: 1.0
+- help: 'Optional GGUF filename (relative to athena_models_path) for the Linguistic
+    persona. Empty = use shared model. Suggested: a strong general-prose model
+    like Llama-3.1-8B-Instruct-Q4_K_M.gguf or Mistral Nemo.'
+  name: linguistic_model_path
+  type: str
+  value: ''
+
 - help: Enable Logical-Mathematical Intelligence.
   name: logical_mathematical_enabled
   type: bool
@@ -93,6 +168,12 @@ static_parameters:
   name: logical_mathematical_weight
   type: float
   value: 1.0
+- help: 'Optional GGUF for the Logical-Mathematical persona. Suggested: a math-tuned
+    model like Qwen2.5-Math-7B-Instruct-Q4_K_M.gguf or DeepSeek-Math-7B.'
+  name: logical_mathematical_model_path
+  type: str
+  value: ''
+
 - help: Enable Visual-Spatial Intelligence.
   name: spatial_enabled
   type: bool
@@ -101,6 +182,12 @@ static_parameters:
   name: spatial_weight
   type: float
   value: 1.0
+- help: 'Optional GGUF for the Spatial persona. Suggested: a vision-language model
+    when query has visual content (Pixtral 12B, Qwen2-VL 7B, Llama-3.2-Vision).'
+  name: spatial_model_path
+  type: str
+  value: ''
+
 - help: Enable Musical Intelligence.
   name: musical_enabled
   type: bool
@@ -109,6 +196,12 @@ static_parameters:
   name: musical_weight
   type: float
   value: 1.0
+- help: 'Optional GGUF for the Musical persona. Smaller general models work fine here
+    (rhythm/sequence is pattern-heavy, less reasoning-heavy).'
+  name: musical_model_path
+  type: str
+  value: ''
+
 - help: Enable Bodily-Kinesthetic Intelligence.
   name: bodily_kinesthetic_enabled
   type: bool
@@ -117,6 +210,13 @@ static_parameters:
   name: bodily_kinesthetic_weight
   type: float
   value: 1.0
+- help: 'Optional GGUF for the Bodily-Kinesthetic persona. Suggested: a code-specialized
+    model (Codestral 22B, DeepSeek-Coder-6.7B) for the ROBOTICS classification path;
+    a general model is fine for cooking/repair/exercise domain classifications.'
+  name: bodily_kinesthetic_model_path
+  type: str
+  value: ''
+
 - help: Enable Interpersonal Intelligence.
   name: interpersonal_enabled
   type: bool
@@ -125,6 +225,12 @@ static_parameters:
   name: interpersonal_weight
   type: float
   value: 1.0
+- help: 'Optional GGUF for the Interpersonal persona. Heavy-RLHF instruction-tuned
+    models suit this domain (Llama-3.1-8B-Instruct, Hermes-3).'
+  name: interpersonal_model_path
+  type: str
+  value: ''
+
 - help: Enable Intrapersonal Intelligence.
   name: intrapersonal_enabled
   type: bool
@@ -133,6 +239,12 @@ static_parameters:
   name: intrapersonal_weight
   type: float
   value: 1.0
+- help: 'Optional GGUF for the Intrapersonal persona. Reasoning-tuned models suit
+    reflective self-questioning (DeepSeek-R1-Distill-Llama-8B, QwQ-32B).'
+  name: intrapersonal_model_path
+  type: str
+  value: ''
+
 - help: Enable Naturalist Intelligence.
   name: naturalist_enabled
   type: bool
@@ -141,4 +253,184 @@ static_parameters:
   name: naturalist_weight
   type: float
   value: 1.0
-version: 1.0.0
+- help: 'Optional GGUF for the Naturalist persona. Long-context models suit systems
+    thinking across many memory entries (Qwen2.5-14B long-context).'
+  name: naturalist_model_path
+  type: str
+  value: ''
+
+
+# v3.1 PEFT sleep-cycle training (hardware-gated) - master switch + method tier + tuning
+- help: 'MASTER SWITCH for sleep-cycle LoRA/DoRA training. When False (default), the sleep cycle
+    exports dream-fragment JSON but does not train. When True, PEFTTrainer.train_all_personas
+    runs at sleep-cycle time using the selected peft_method. Requires torch + peft + transformers
+    (+ bitsandbytes for quantized methods).'
+  name: enable_lora_training
+  type: bool
+  value: false
+- help: 'PEFT method tier. Tier 1 (~16GB VRAM): pissa_qlora. Tier 2 (24-48GB): qdora.
+    Tier 3 (multi-GPU): fsdp_qdora. Tier 3 alt (single 80GB+): galore.
+    qgalore: Q-GaLore INT4-quantized full FT for 7-8B specialist persona models on 16GB VRAM.
+    disabled skips training even when enable_lora_training is True.'
+  name: peft_method
+  options:
+  - disabled
+  - pissa_qlora
+  - qdora
+  - fsdp_qdora
+  - galore
+  - qgalore
+  type: str
+  value: pissa_qlora
+- help: LoRA / DoRA rank. Tier 1 16. Tier 2 32-64. Tier 3 64+.
+  name: lora_rank
+  type: int
+  value: 16
+- help: 'LoRA alpha scaling. Convention: alpha = 2 * rank.'
+  name: lora_alpha
+  type: float
+  value: 32.0
+- help: LoRA dropout. Small per-persona datasets benefit from modest dropout.
+  name: lora_dropout
+  type: float
+  value: 0.05
+- help: Learning rate for PEFT training. Conservative default limits catastrophic forgetting.
+  name: lora_learning_rate
+  type: float
+  value: 0.00005
+- help: Epochs per sleep-cycle training run. 1-3 is the safe range.
+  name: lora_epochs
+  type: int
+  value: 2
+- help: Min accumulated dream-fragment examples before a persona's training is triggered.
+  name: min_training_examples
+  type: int
+  value: 200
+- help: Optional JSONL of general-purpose anchor examples for catastrophic-forgetting mitigation.
+  name: anchor_set_path
+  type: str
+  value: ''
+- help: 'Ratio of anchor examples per dream example. 3.0 = 3 anchors per 1 dream. Set 0 to disable.'
+  name: anchor_to_dream_ratio
+  type: float
+  value: 3.0
+- help: 'Adapter accumulation strategy. merge_and_reset / stack / consolidate_periodically.'
+  name: adapter_strategy
+  options:
+  - merge_and_reset
+  - stack
+  - consolidate_periodically
+  type: str
+  value: merge_and_reset
+- help: Min validation score for a fresh adapter to be accepted (relative to base).
+  name: validation_quality_threshold
+  type: float
+  value: 0.85
+- help: Directory where per-persona LoRA / DoRA adapter checkpoints are saved.
+  name: peft_models_path
+  type: str
+  value: data/models/peft_adapters
+
+
+# --- v3.1 advanced PEFT tunables (architecture, hardware, optimization) ---
+- help: 'Comma-separated transformer module names where LoRA/DoRA adapters are inserted.
+    Default fits Llama / Mistral / Qwen2 attention. Add MLP layers for more aggressive
+    adaptation: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj.'
+  name: lora_target_modules
+  type: str
+  value: q_proj,k_proj,v_proj,o_proj
+- help: 'Apply DoRA weight decomposition on top of LoRA. Already implied when
+    peft_method=qdora; enabling under pissa_qlora produces a PiSSA-DoRA hybrid.'
+  name: lora_use_dora
+  type: bool
+  value: false
+- help: 'LoRA weight initialization. pissa: SVD-based (faster convergence).
+    gaussian: vanilla LoRA. loftq: quantization-aware init.'
+  name: lora_init_method
+  options:
+  - pissa
+  - gaussian
+  - loftq
+  type: str
+  value: pissa
+- help: 'Maximum tokens per training example. Longer = more context, more VRAM.
+    1024 fits typical dream-fragment Q/A pairs; raise to 2048 for long entries.'
+  name: max_sequence_length
+  type: int
+  value: 1024
+- help: 'Examples per gradient step on each GPU. Tier 1 (~16GB) holds at 1; larger
+    VRAM can raise to 2-4. Effective batch = this * gradient_accumulation_steps.'
+  name: per_device_train_batch_size
+  type: int
+  value: 1
+- help: 'Forward passes accumulated before each optimizer step. Trades time for memory.'
+  name: gradient_accumulation_steps
+  type: int
+  value: 4
+- help: 'Recompute activations during backward pass (saves memory, ~20-30% slower).
+    Recommended for Tier 1 (16GB VRAM).'
+  name: gradient_checkpointing
+  type: bool
+  value: true
+- help: 'Compute precision when base is loaded in 4-bit. bfloat16 for Ampere/Ada/Hopper
+    (RTX 30/40, A100, H100). float16 for older cards (Turing/Volta).'
+  name: quantization_compute_dtype
+  options:
+  - bfloat16
+  - float16
+  type: str
+  value: bfloat16
+- help: 'Bitsandbytes 4-bit quantization scheme. nf4 (NormalFloat4) is the QLoRA paper
+    default and preserves quality better than fp4.'
+  name: bnb_4bit_quant_type
+  options:
+  - nf4
+  - fp4
+  type: str
+  value: nf4
+- help: 'Quantize the quantization constants themselves (~0.4 bits/parameter savings).
+    Standard QLoRA practice.'
+  name: bnb_4bit_use_double_quant
+  type: bool
+  value: true
+- help: 'Optimizer. paged_adamw_8bit (default): best for QLoRA. adamw_torch: 32-bit.
+    galore_adamw: only with peft_method=galore.'
+  name: optimizer
+  options:
+  - paged_adamw_8bit
+  - adamw_torch
+  - adamw_torch_fused
+  - galore_adamw
+  type: str
+  value: paged_adamw_8bit
+- help: 'Learning rate schedule. cosine usually converges to a slightly better final loss.
+    constant suits very small datasets where decay would stop learning early.'
+  name: lr_scheduler_type
+  options:
+  - cosine
+  - linear
+  - constant
+  - constant_with_warmup
+  type: str
+  value: cosine
+- help: 'Fraction of training steps used for LR warmup. 3% is safe default; raise to
+    10% for very small datasets or aggressive learning rates.'
+  name: warmup_ratio
+  type: float
+  value: 0.03
+- help: 'AdamW weight decay coefficient. Small values are standard for LoRA fine-tuning
+    since adapter weights are themselves a regularizer. 0.0 disables.'
+  name: weight_decay
+  type: float
+  value: 0.001
+- help: 'When to save adapter checkpoints. epoch: end of every epoch (safe default).
+    no: only at the very end. steps: every N steps.'
+  name: save_strategy
+  options:
+  - 'no'
+  - epoch
+  - steps
+  type: str
+  value: epoch
+
+version: 2.0.0
